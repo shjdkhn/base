@@ -2573,7 +2573,7 @@ mod tests {
                         Instant::now(),
                     ),
                     fallback_block_gas_limit: 30_000_000,
-                    block_time: Duration::from_secs(2),
+                    block_time: Duration::from_millis(200),
                     presign_target_gas: 0,
                     max_in_flight_per_sender: 1,
                     max_total_in_flight: 1,
