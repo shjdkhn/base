@@ -83,12 +83,13 @@ pub enum P2pRpcRequest {
         /// The peer id to disconnect.
         peer_id: PeerId,
     },
-    /// Protects a given peer from disconnection.
+    /// Protects a given peer from disconnection and exempts its connections from the swarm's
+    /// connection limits.
     ProtectPeer {
         /// The id of the peer.
         peer_id: PeerId,
     },
-    /// Unprotects a given peer.
+    /// Unprotects a given peer, subjecting its new connections to the connection limits again.
     UnprotectPeer {
         /// The id of the peer.
         peer_id: PeerId,
@@ -121,8 +122,8 @@ impl P2pRpcRequest {
             Self::BlockAddr { address } => gossip.connection_gate.block_addr(address),
             Self::UnblockAddr { address } => gossip.connection_gate.unblock_addr(address),
             Self::ListBlockedAddrs(s) => Self::list_blocked_addrs(s, gossip),
-            Self::ProtectPeer { peer_id } => gossip.connection_gate.protect_peer(peer_id),
-            Self::UnprotectPeer { peer_id } => gossip.connection_gate.unprotect_peer(peer_id),
+            Self::ProtectPeer { peer_id } => Self::protect_peer(peer_id, gossip),
+            Self::UnprotectPeer { peer_id } => Self::unprotect_peer(peer_id, gossip),
             Self::BlockSubnet { address } => gossip.connection_gate.block_subnet(address),
             Self::UnblockSubnet { address } => gossip.connection_gate.unblock_subnet(address),
             Self::ListBlockedSubnets(s) => Self::list_blocked_subnets(s, gossip),
@@ -144,6 +145,18 @@ impl P2pRpcRequest {
     fn unblock_peer<G: ConnectionGate>(id: PeerId, gossip: &mut GossipDriver<G>) {
         gossip.connection_gate.unblock_peer(&id);
         gossip.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&id);
+    }
+
+    fn protect_peer<G: ConnectionGate>(peer_id: PeerId, gossip: &mut GossipDriver<G>) {
+        gossip.connection_gate.protect_peer(peer_id);
+        // Bypassed connections skip the limit checks but still count toward the totals, so
+        // protected peers can join a full node and occupy slots unprotected peers would get.
+        gossip.swarm.behaviour_mut().connection_limits.bypass_peer_id(&peer_id);
+    }
+
+    fn unprotect_peer<G: ConnectionGate>(peer_id: PeerId, gossip: &mut GossipDriver<G>) {
+        gossip.connection_gate.unprotect_peer(peer_id);
+        gossip.swarm.behaviour_mut().connection_limits.remove_peer_id(&peer_id);
     }
 
     fn list_blocked_peers<G: ConnectionGate>(s: Sender<Vec<PeerId>>, gossip: &GossipDriver<G>) {
@@ -625,5 +638,131 @@ impl P2pRpcRequest {
                 warn!(target: "p2p_rpc", error = ?e, "Failed to send peer count through response channel");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use alloy_chains::Chain;
+    use alloy_primitives::Address;
+    use base_common_genesis::RollupConfig;
+    use libp2p::{
+        identity::Keypair,
+        swarm::{ListenError, SwarmEvent, dial_opts::DialOpts},
+    };
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::{ConnectionGater, ConnectionLimitsConfig, Event};
+
+    /// A target node with a single connection slot and two real TCP peers dialling it.
+    struct FullTarget {
+        target: GossipDriver<ConnectionGater>,
+        filler: GossipDriver<ConnectionGater>,
+        peer: GossipDriver<ConnectionGater>,
+    }
+
+    impl FullTarget {
+        fn driver(limits: ConnectionLimitsConfig) -> GossipDriver<ConnectionGater> {
+            let rollup_config = RollupConfig {
+                l2_chain_id: Chain::base_mainnet(),
+                block_time: 2,
+                ..Default::default()
+            };
+            GossipDriver::<ConnectionGater>::builder(
+                rollup_config,
+                Address::repeat_byte(0x11),
+                "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+                Keypair::generate_secp256k1(),
+            )
+            .with_connection_limits_config(limits)
+            .build()
+            .unwrap()
+            .0
+        }
+
+        /// Drives all three swarms until the target emits an event matching `done`.
+        async fn poll_target_until(&mut self, done: impl Fn(&SwarmEvent<Event>) -> bool) {
+            loop {
+                tokio::select! {
+                    event = self.target.next() => {
+                        let event = event.expect("target swarm remains open");
+                        let matched = done(&event);
+                        self.target.handle_event(event);
+                        if matched {
+                            return;
+                        }
+                    }
+                    event = self.filler.next() => {
+                        self.filler.handle_event(event.expect("filler swarm remains open"));
+                    }
+                    event = self.peer.next() => {
+                        self.peer.handle_event(event.expect("peer swarm remains open"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dials from a fresh local port. Reusing the listen port makes a redial collide with the
+    /// previous connection's socket while it lingers in `TIME_WAIT`.
+    fn dial(driver: &mut GossipDriver<ConnectionGater>, addr: &Multiaddr) {
+        let opts = DialOpts::unknown_peer_id().address(addr.clone()).allocate_new_port().build();
+        driver.swarm.dial(opts).unwrap();
+    }
+
+    fn established(peer_id: PeerId) -> impl Fn(&SwarmEvent<Event>) -> bool {
+        move |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id: id, .. } if *id == peer_id)
+    }
+
+    fn closed(peer_id: PeerId) -> impl Fn(&SwarmEvent<Event>) -> bool {
+        move |event| matches!(event, SwarmEvent::ConnectionClosed { peer_id: id, .. } if *id == peer_id)
+    }
+
+    fn denied(event: &SwarmEvent<Event>) -> bool {
+        matches!(
+            event,
+            SwarmEvent::IncomingConnectionError { error: ListenError::Denied { .. }, .. }
+        )
+    }
+
+    #[tokio::test]
+    async fn protected_peer_bypasses_connection_limits() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut nodes = FullTarget {
+                target: FullTarget::driver(ConnectionLimitsConfig::new(1)),
+                filler: FullTarget::driver(ConnectionLimitsConfig::default()),
+                peer: FullTarget::driver(ConnectionLimitsConfig::default()),
+            };
+            let target_addr = nodes.target.start().await.unwrap();
+            nodes.filler.start().await.unwrap();
+            nodes.peer.start().await.unwrap();
+            let filler_id = *nodes.filler.local_peer_id();
+            let peer_id = *nodes.peer.local_peer_id();
+            let (disc_sender, _disc_receiver) = mpsc::channel(1);
+            let disc = Discv5Handler::new(0, disc_sender);
+
+            dial(&mut nodes.filler, &target_addr);
+            nodes.poll_target_until(established(filler_id)).await;
+
+            dial(&mut nodes.peer, &target_addr);
+            nodes.poll_target_until(denied).await;
+
+            P2pRpcRequest::ProtectPeer { peer_id }.handle(&mut nodes.target, &disc);
+            dial(&mut nodes.peer, &target_addr);
+            nodes.poll_target_until(established(peer_id)).await;
+            assert!(nodes.target.swarm.is_connected(&filler_id));
+
+            // Unprotecting does not drop the connection, but a reconnect is limited again.
+            P2pRpcRequest::UnprotectPeer { peer_id }.handle(&mut nodes.target, &disc);
+            nodes.target.swarm.disconnect_peer_id(peer_id).unwrap();
+            nodes.poll_target_until(closed(peer_id)).await;
+            dial(&mut nodes.peer, &target_addr);
+            nodes.poll_target_until(denied).await;
+        })
+        .await
+        .expect("protected peer must connect to a full node and be limited once unprotected");
     }
 }

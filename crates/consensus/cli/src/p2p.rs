@@ -85,8 +85,8 @@ pub struct P2PNetworkArgs {
     /// UDP port to bind Discv5 to. Same as TCP port if left 0.
     #[arg(long = "p2p.listen.udp", default_value = "9223", env = "BASE_NODE_P2P_LISTEN_UDP_PORT")]
     pub listen_udp_port: u16,
-    /// High-tide peer count. The node starts pruning peer connections slowly after reaching this
-    /// number.
+    /// Maximum number of established peer connections. Connections beyond this limit are refused,
+    /// except those from peers protected with `opp2p_protectPeer` on this node.
     #[arg(long = "p2p.peers.hi", default_value = "30", env = "BASE_NODE_P2P_PEERS_HI")]
     pub peers_hi: u32,
     /// Maximum number of outbound libp2p connections that may be pending at once.
