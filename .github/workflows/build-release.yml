@@ -382,7 +382,7 @@ jobs:
               sources+=("${image}@sha256:${digest##*/}")
             done
 
-            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}" || return 1
             docker buildx imagetools inspect "${image}:${TAG}"
           }
 
